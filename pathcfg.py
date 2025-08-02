@@ -1,0 +1,5 @@
+Sam2Checkpoint = "./Sam2ModelFiles/sam2.1_hiera_large.pt"
+Sam2Cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+DetectorCheckpoint = "./GroundingDINO/weights/groundingdino_swint_ogc.pth"
+DetectorCfg = "./GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+VideoDir = "./testvideo/bedroom"
