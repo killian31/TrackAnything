@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 import uuid
+import argparse
 
 import numpy as np
 import torch
@@ -48,7 +49,13 @@ from sam2mot.CI import CI
 # Initialize Flask app
 app = Flask(__name__)
 app.config["SECRET_KEY"] = ""
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="eventlet",
+    ping_timeout=120,
+    ping_interval=30,
+)
 
 
 def get_video_fps(video_path):
@@ -93,14 +100,8 @@ class SAM2MOTTracker:
         self.box_threshold = 0.35
         self.text_threshold = 0.25
 
-        # Device setup
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if (
-            self.device.type == "cuda"
-            and torch.cuda.get_device_properties(0).major >= 8
-        ):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+        self.available_devices = self._detect_devices()
+        self.set_device("auto")  # Set default device
 
         # Status tracking
         self.is_tracking = False
@@ -116,6 +117,87 @@ class SAM2MOTTracker:
     def is_initialized(self):
         return self.detector is not None and self.predictor is not None
 
+    def _detect_devices(self):
+        """Detect available compute devices"""
+        devices = [{"id": "cpu", "name": "CPU", "type": "cpu"}]
+
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                device_name = torch.cuda.get_device_name(i)
+                memory_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                devices.append(
+                    {
+                        "id": f"cuda:{i}",
+                        "name": f"CUDA:{i} - {device_name} ({memory_gb:.1f}GB)",
+                        "type": "cuda",
+                    }
+                )
+
+        return devices
+
+    def set_device(self, device_id):
+        """Set the compute device. If models are loaded, unload them to ensure correct device usage."""
+        if device_id == "auto":
+            # Auto-select best available device
+            if torch.cuda.is_available():
+                device_id = "cuda:0"
+            else:
+                device_id = "cpu"
+
+        # If models are loaded, unload them before changing device
+        models_were_loaded = self.is_initialized
+        if models_were_loaded:
+            self.unload_models()
+
+        self.device = torch.device(device_id)
+
+        # Set the global CUDA device to ensure all ops/models use the correct GPU
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+
+        # Configure CUDA optimizations if using CUDA
+        if (
+            self.device.type == "cuda"
+            and torch.cuda.get_device_properties(self.device.index or 0).major >= 8
+        ):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        self.dtype = (
+            torch.bfloat16
+            if self.device.type == "cuda" and torch.cuda.is_bf16_supported()
+            else torch.float32
+        )
+
+    def get_available_devices(self):
+        """Get list of available devices"""
+        return self.available_devices
+
+    def get_current_device_info(self):
+        """Get current device information"""
+        device_info = {
+            "device_id": str(self.device),
+            "device_type": self.device.type,
+            "dtype": str(self.dtype),
+        }
+
+        if self.device.type == "cuda":
+            device_info.update(
+                {
+                    "device_name": torch.cuda.get_device_name(self.device),
+                    "memory_total": torch.cuda.get_device_properties(
+                        self.device
+                    ).total_memory
+                    / (1024**3),
+                    "memory_allocated": torch.cuda.memory_allocated(self.device)
+                    / (1024**3),
+                    "memory_reserved": torch.cuda.memory_reserved(self.device)
+                    / (1024**3),
+                }
+            )
+
+        return device_info
+
     def initialize_models(self, session_id):
         """Initialize all models"""
         try:
@@ -128,8 +210,9 @@ class SAM2MOTTracker:
             self.detector = load_model(
                 model_config_path=self.detector_cfg,
                 model_checkpoint_path=self.detector_checkpoint,
-                device=self.device,
+                device=str(self.device),
             )
+            self.detector = self.detector.to(self.device)
 
             socketio.emit(
                 "progress_update",
@@ -140,7 +223,7 @@ class SAM2MOTTracker:
             self.predictor = build_sam2_video_predictor(
                 self.sam2_model_cfg,
                 self.sam2_checkpoint,
-                device=self.device,
+                device=str(self.device),
                 vos_optimized=False,
             )
 
@@ -262,6 +345,7 @@ class SAM2MOTTracker:
                         caption=self.text_prompt,
                         box_threshold=self.box_threshold,
                         text_threshold=self.text_threshold,
+                        device=str(self.device),
                     )
                     boxes = box_convert(
                         boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy"
@@ -310,6 +394,7 @@ class SAM2MOTTracker:
                         room=session_id,
                     )
                     self.predictor.reset_state(self.inference_state)
+                    eventlet.sleep(0)
                     return False, "Tracking stopped by user"
 
                 progress = 52 + ((frame_id + 1) / total_frames) * 38
@@ -322,13 +407,14 @@ class SAM2MOTTracker:
                 if frame_id > 0:
                     has_objects = len(self.inference_state["obj_ids"]) > 0
                     if has_objects:
-                        with torch.autocast("cuda", dtype=self.dtype):
+                        with torch.autocast(self.device.type, dtype=self.dtype):
                             for _, _, _ in self.predictor.propagate_in_video(
                                 self.inference_state,
                                 start_frame_idx=frame_id,
                                 max_frame_num_to_track=0,
                             ):
                                 pass
+                        eventlet.sleep(0)
 
                 # Trajectory management
                 new_prompts, obj_ids, removed = self.tms.TrajectroyManage(
@@ -336,7 +422,7 @@ class SAM2MOTTracker:
                     inference_state=self.inference_state,
                     det_bboxes=det_bboxes,
                     det_logits=det_logits,
-                    device=self.device,
+                    device=str(self.device),
                 )
 
                 socketio.emit(
@@ -349,12 +435,13 @@ class SAM2MOTTracker:
                 )
 
                 # SAM2 tracking
-                with torch.autocast("cuda", dtype=self.dtype):
+                with torch.autocast(self.device.type, dtype=self.dtype):
                     if removed:
                         for obj_id in removed:
                             self.predictor.remove_object(
                                 inference_state=self.inference_state, obj_id=obj_id
                             )
+                            eventlet.sleep(0)
                     if len(new_prompts) > 0:
                         for i, obj_id in enumerate(obj_ids):
                             _, out_obj_ids, out_mask_logits = (
@@ -365,18 +452,20 @@ class SAM2MOTTracker:
                                     box=np.array(new_prompts[i]),
                                 )
                             )
+                            eventlet.sleep(0)
                         for _, _, _ in self.predictor.propagate_in_video(
                             self.inference_state,
                             start_frame_idx=frame_id,
                             max_frame_num_to_track=0,
                         ):
                             pass
+                        eventlet.sleep(0)
 
                 # Occlusion handling
                 occluded = self.ci.remove_occlusion(
                     inference_state=self.inference_state,
                     frame_id=frame_id,
-                    device=self.device,
+                    device=str(self.device),
                 )
                 if occluded:
                     for obj_id in occluded:
@@ -395,7 +484,7 @@ class SAM2MOTTracker:
                 tck_ids, _, tck_bboxes, _, tck_masks = self.tms.get_trackinfo(
                     frame_idx=frame_id,
                     inference_state=self.inference_state,
-                    device=self.device,
+                    device=str(self.device),
                 )
 
                 frame_path = os.path.join(video_dir, frame_names[frame_id])
@@ -430,6 +519,7 @@ class SAM2MOTTracker:
                     with open(output_path, "a") as f:
                         line = ",".join(map(str, res)) + "\n"
                         f.write(line)
+                    eventlet.sleep(0)
 
                     image = show_mask(image, mask, obj_id=obj_id)
                     image = show_box(image=image, box=bbox, obj_id=obj_id)
@@ -466,7 +556,9 @@ class SAM2MOTTracker:
                 image_folder=output_frames_dir,
                 output_video_path=output_mp4_path,
                 frame_rate=fps,
+                web_compatible=True,
             )
+            eventlet.sleep(0)
             for jpg in glob.glob(os.path.join(output_frames_dir, "*.jpg")):
                 os.remove(jpg)
 
@@ -500,27 +592,31 @@ class SAM2MOTTracker:
 
     def cleanup(self):
         """Clean up resources"""
-        torch.cuda.empty_cache()
+        # Only clear CUDA cache if CUDA is available and device is CUDA
+        if (
+            hasattr(self, "device")
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[WARN] torch.cuda.empty_cache() failed: {e}")
 
     def unload_models(self):
         self.detector = None
         self.predictor = None
         self.tms = None
         self.ci = None
-        torch.cuda.empty_cache()
-
-
-# Global tracker instance
-tracker = SAM2MOTTracker()
-
-import shutil
-import subprocess
-import uuid
-
-from werkzeug.utils import secure_filename
-
-UPLOAD_ROOT = "/tmp/sam2mot_videos"
-os.makedirs(UPLOAD_ROOT, exist_ok=True)
+        if (
+            hasattr(self, "device")
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[WARN] torch.cuda.empty_cache() failed: {e}")
 
 
 def extract_frames_ffmpeg(video_path, frames_dir):
@@ -571,18 +667,21 @@ def upload_video():
         return jsonify({"error": "No video file provided"}), 400
 
     video_file = request.files["video"]
-    if video_file.filename == "":
+    if not hasattr(video_file, "filename") or not video_file.filename:
         return jsonify({"error": "No selected file"}), 400
-    if not video_file.filename.lower().endswith(".mp4"):
+    if not isinstance(
+        video_file.filename, str
+    ) or not video_file.filename.lower().endswith(".mp4"):
         return jsonify({"error": "File must be .mp4"}), 400
 
     session_id = str(uuid.uuid4())
     session_dir = os.path.join(UPLOAD_ROOT, session_id)
     os.makedirs(session_dir, exist_ok=True)
-    video_save_path = os.path.join(session_dir, secure_filename(video_file.filename))
+    safe_filename = secure_filename(video_file.filename)
+    video_save_path = os.path.join(session_dir, safe_filename)
     frames_dir = os.path.join(session_dir, "frames")
     video_file.save(video_save_path)
-    video_url = f"/uploads/{session_id}/{secure_filename(video_file.filename)}"
+    video_url = f"/uploads/{session_id}/{safe_filename}"
 
     try:
         extract_frames(video_save_path, frames_dir)
@@ -616,13 +715,54 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/devices")
+def get_devices():
+    """Get available compute devices"""
+    return jsonify(
+        {
+            "devices": tracker.get_available_devices(),
+            "current": tracker.get_current_device_info(),
+        }
+    )
+
+
+@app.route("/api/set_device", methods=["POST"])
+def set_device():
+    """Set compute device"""
+    if tracker.is_tracking:
+        return jsonify({"error": "Cannot change device while tracking"}), 400
+    if tracker.is_initialized:
+        return (
+            jsonify(
+                {
+                    "error": "Cannot change device after models are initialized. Please unload models first."
+                }
+            ),
+            400,
+        )
+    data = request.json
+    if not data or "device_id" not in data:
+        return jsonify({"error": "Missing device_id"}), 400
+    device_id = data["device_id"]
+    try:
+        tracker.set_device(device_id)
+        return jsonify(
+            {
+                "message": f"Device set to {device_id}",
+                "device_info": tracker.get_current_device_info(),
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to set device: {str(e)}"}), 500
+
+
 @app.route("/api/status")
 def get_status():
     return jsonify(
         {
             "initialized": tracker.is_initialized,
             "tracking": tracker.is_tracking,
-            "device": str(tracker.device),
+            "device_info": tracker.get_current_device_info(),
         }
     )
 
@@ -631,9 +771,9 @@ def get_status():
 def initialize_models():
     if tracker.is_tracking:
         return jsonify({"error": "Cannot initialize while tracking"}), 400
-
     data = request.json
-
+    if not data:
+        return jsonify({"error": "Missing request data"}), 400
     # Update model paths if provided
     if "detector_cfg" in data:
         tracker.detector_cfg = data["detector_cfg"]
@@ -643,7 +783,6 @@ def initialize_models():
         tracker.sam2_model_cfg = data["sam2_cfg"]
     if "sam2_checkpoint" in data:
         tracker.sam2_checkpoint = data["sam2_checkpoint"]
-
     session_id = data.get("session_id", "default")
 
     # Run initialization in background thread
@@ -651,7 +790,6 @@ def initialize_models():
         tracker.initialize_models(session_id)
 
     eventlet.spawn_n(init_worker)
-
     return jsonify({"message": "Initialization started"})
 
 
@@ -665,34 +803,29 @@ def unload_models():
 def start_tracking():
     if not tracker.is_initialized:
         return jsonify({"error": "Models not initialized"}), 400
-
     if tracker.is_tracking:
         return jsonify({"error": "Already tracking"}), 400
-
     data = request.json
-
+    if not data:
+        return jsonify({"error": "Missing request data"}), 400
     # Validate required fields
     required_fields = ["video_dir", "session_id", "fps"]
     for field in required_fields:
         if field not in data:
             return jsonify({"error": f"Missing required field: {field}"}), 400
-
     # Set tracking parameters
     tracker.set_tracking_parameters(
         text_prompt=data.get("text_prompt", "person"),
         box_threshold=data.get("box_threshold", 0.35),
         text_threshold=data.get("text_threshold", 0.25),
     )
-
     video_dir = data["video_dir"]
     session_id = data["session_id"]
     fps = data["fps"]
     session_dir = os.path.join(UPLOAD_ROOT, session_id)
     os.makedirs(session_dir, exist_ok=True)
-
     output_path = os.path.join(session_dir, "tracker.txt")
     output_frames_dir = os.path.join(session_dir, "output_frames")
-
     os.makedirs(output_frames_dir, exist_ok=True)
 
     # Run tracking in background thread
@@ -713,7 +846,6 @@ def start_tracking():
         )
 
     threading.Thread(target=track_worker, daemon=True).start()
-
     return jsonify({"message": "Tracking started"})
 
 
@@ -726,16 +858,26 @@ def stop_tracking():
 @app.route("/tracked_frame")
 def tracked_frame():
     path = request.args.get("path")
-    if not path or ".." in path:
+    if not path or ".." in path or not os.path.exists(path):
         return "Invalid path", 400
-    return send_file(path)
+    try:
+        return send_file(path)
+    except Exception as e:
+        return f"Failed to send file: {str(e)}", 500
 
 
 @app.route("/output_video")
 def output_video():
     session = request.args.get("session")
-    path = f"/tmp/sam2mot_videos/{session}/output_video.mp4"
-    return send_file(path)
+    if not session:
+        return "Missing session parameter", 400
+    video_path = os.path.join(UPLOAD_ROOT, session, "output_video.mp4")
+    if not os.path.exists(video_path):
+        return "Video not found", 404
+    try:
+        return send_file(video_path, mimetype="video/mp4")
+    except Exception as e:
+        return f"Failed to send video: {str(e)}", 500
 
 
 @app.route("/api/directories")
@@ -764,13 +906,15 @@ def list_directories():
 
 @socketio.on("connect")
 def handle_connect():
-    print(f"Client connected: {request.sid}")
-    emit("connected", {"session_id": request.sid})
+    sid = getattr(request, "sid", None)
+    print(f"Client connected: {sid}")
+    emit("connected", {"session_id": sid or str(uuid.uuid4())})
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    print(f"Client disconnected: {request.sid}")
+    sid = getattr(request, "sid", None)
+    print(f"Client disconnected: {sid}")
 
 
 # HTML Template
@@ -780,7 +924,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SAM2MOT - Multi-Object Tracker</title>
+    <title>TrackAnything</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <style>
         * {
@@ -950,26 +1094,77 @@ HTML_TEMPLATE = """
             font-size: 12px;
         }
         
-        .device-info {
+        .device-selector {
             background: #f0f9ff;
             border: 2px solid #0ea5e9;
             color: #0c4a6e;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .device-info {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
             padding: 10px;
             border-radius: 5px;
-            margin-bottom: 15px;
+            margin-top: 10px;
+            font-size: 12px;
+        }
+        
+        .device-warning {
+            background: #fef3c7;
+            border: 1px solid #f59e0b;
+            color: #92400e;
+            padding: 8px;
+            border-radius: 4px;
+            margin-top: 8px;
+            font-size: 12px;
+        }
+        
+        .video-container {
+            margin-top: 20px;
+            text-align: center;
+        }
+        
+        .video-container video {
+            max-width: 100%;
+            max-height: 400px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        
+        .video-info {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f0f9ff;
+            border-radius: 5px;
+            color: #0c4a6e;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>SAM2MOT Tracker</h1>
-            <p>Multi-Object Tracking with SAM2 and GroundingDINO</p>
+            <h1>TrackAnything</h1>
+            <p>Track anything in videos from a single text prompt.</p>
+            <p>Powered by <a href="https://arxiv.org/abs/2504.04519" target="_blank" style="color: #f0f9ff; text-decoration: underline;">SAM2MOT</a></p>
+            <p>Version: 1.0.0</p>
         </div>
         
         <div class="main-content">
-            <div id="deviceInfo" class="device-info">
-                <strong>Device:</strong> <span id="deviceName">Loading...</span>
+            <div class="device-selector">
+                <div class="form-group">
+                    <label for="deviceSelect"><strong>🖥️ Compute Device:</strong></label>
+                    <select id="deviceSelect" style="margin-top: 8px;">
+                        <option value="">Loading devices...</option>
+                    </select>
+                    <button id="unloadModelsBtn" class="btn btn-danger" style="margin-left:12px;">Unload Models</button>
+                    <div id="deviceWarning" class="device-warning" style="display: none;"></div>
+                </div>
+                <div id="deviceInfo" class="device-info">
+                    <strong>Current Device:</strong> <span id="currentDeviceInfo">Loading...</span>
+                </div>
             </div>
 
             <div class="section" style="background: #e0f7fa;">
@@ -981,6 +1176,11 @@ HTML_TEMPLATE = """
                     </label>
                     <button type="submit" class="btn">Upload Video</button>
                 </form>
+                <div id="videoInputStatus" class="status info" style="display:none;"></div>
+                <div id="videoInputProgressBar" class="progress-bar" style="display:none;margin:10px 0 5px 0;">
+                    <div id="videoInputProgressFill" class="progress-fill"></div>
+                </div>
+                <div id="videoInputLog" class="log-container" style="display:none;height:80px;"></div>
                 <div id="videoInfo"></div>
                 <div id="videoPreview" style="margin:15px 0;max-width: 400px;"></div>
             </div>
@@ -1051,8 +1251,18 @@ HTML_TEMPLATE = """
                 </div>
 
                 <div id="downloadLinkContainer" style="margin-top:12px;"></div>
-
-
+                
+                <!-- Add video display container -->
+                <div id="outputVideoContainer" class="video-container" style="display: none;">
+                    <h4>📹 Tracking Result</h4>
+                    <video id="outputVideo" controls preload="metadata">
+                        <source id="outputVideoSource" src="" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                    <div class="video-info">
+                        <strong>Output Video Ready!</strong> You can play the video above or download it using the button.
+                    </div>
+                </div>
             </div>
             
             <div class="section">
@@ -1128,6 +1338,7 @@ HTML_TEMPLATE = """
         socket.on('connected', (data) => {
             sessionId = data.session_id;
             logMessage('Connected to server');
+            loadDevices();
             loadStatus();
         });
         
@@ -1158,14 +1369,43 @@ HTML_TEMPLATE = """
                 logMessage('✅ Tracking completed');
                 logMessage('📄 Results saved to: ' + data.output_path);
                 logMessage('🎥 Video saved to: ' + data.video_path);
-                // document.getElementById('liveTrackedFrame').innerHTML =
-                // //      `<video controls style="max-width:520px;border-radius:12px;box-shadow:0 2px 14px #0002;" src="${data.output_video_url}"></video>`;
 
                 // Show download button
                 document.getElementById('downloadLinkContainer').innerHTML =
                     `<a href="${data.output_video_url}" download="output_video.mp4" class="btn" style="display:inline-block;margin-top:10px;">
                         ⬇️ Download Output Video
                     </a>`;
+                
+                // Display the output video
+                const outputVideoContainer = document.getElementById('outputVideoContainer');
+                const outputVideo = document.getElementById('outputVideo');
+                const outputVideoSource = document.getElementById('outputVideoSource');
+
+                // Wait for the video file to be available before displaying
+                const videoUrl = data.output_video_url + '&t=' + new Date().getTime();
+                async function waitForVideo(url, maxTries = 10, delayMs = 500) {
+                    for (let i = 0; i < maxTries; i++) {
+                        try {
+                            const resp = await fetch(url, { method: 'HEAD' });
+                            if (resp.ok) return true;
+                        } catch (e) {}
+                        await new Promise(res => setTimeout(res, delayMs));
+                    }
+                    return false;
+                }
+                (async () => {
+                    const found = await waitForVideo(videoUrl);
+                    if (!found) {
+                        updateStatus('Output video not available yet. Try refreshing.', 'error');
+                        logMessage('❌ Output video not available after waiting.');
+                        return;
+                    }
+                    outputVideoSource.src = videoUrl;
+                    outputVideo.load();
+                    outputVideoContainer.style.display = 'block';
+                    outputVideoContainer.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    logMessage('🎬 Output video is now available for viewing');
+                })();
             } else {
                 updateStatus('Tracking failed', 'error');
                 logMessage('❌ Tracking failed: ' + data.message);
@@ -1238,15 +1478,150 @@ HTML_TEMPLATE = """
             }
         });
         
+        // Device management
+        let availableDevices = [];
+        let currentDeviceInfo = {};
+        const unloadModelsBtn = document.getElementById('unloadModelsBtn');
+
+        async function loadDevices() {
+            try {
+                const response = await fetch('/api/devices');
+                const data = await response.json();
+
+                availableDevices = data.devices;
+                currentDeviceInfo = data.current;
+
+                // Populate device dropdown
+                const deviceSelect = document.getElementById('deviceSelect');
+                deviceSelect.innerHTML = '';
+
+                availableDevices.forEach(device => {
+                    const option = document.createElement('option');
+                    option.value = device.id;
+                    option.textContent = device.name;
+
+                    // Select current device
+                    if (device.id === currentDeviceInfo.device_id) {
+                        option.selected = true;
+                    }
+
+                    deviceSelect.appendChild(option);
+                });
+
+                updateDeviceInfo();
+                updateUnloadBtn();
+
+            } catch (error) {
+                logMessage('❌ Failed to load devices: ' + error.message);
+                document.getElementById('deviceSelect').innerHTML = '<option>Error loading devices</option>';
+            }
+        }
+
+        function updateDeviceInfo() {
+            const deviceInfoElement = document.getElementById('currentDeviceInfo');
+            let infoText = `${currentDeviceInfo.device_id} (${currentDeviceInfo.dtype})`;
+
+            if (currentDeviceInfo.device_type === 'cuda') {
+                infoText += ` - ${currentDeviceInfo.device_name}`;
+                infoText += ` | Memory: ${currentDeviceInfo.memory_allocated.toFixed(1)}GB / ${currentDeviceInfo.memory_total.toFixed(1)}GB`;
+            }
+
+            deviceInfoElement.textContent = infoText;
+        }
+
+        function updateUnloadBtn() {
+            // Always show the unload button
+            unloadModelsBtn.style.display = '';
+        }
+
+        // Device selection handler
+        document.getElementById('deviceSelect').addEventListener('change', async function() {
+            const selectedDevice = this.value;
+            if (!selectedDevice || selectedDevice === currentDeviceInfo.device_id) return;
+
+            // Show warning if models are initialized
+            const deviceWarning = document.getElementById('deviceWarning');
+            if (modelsInitialized) {
+                deviceWarning.textContent = 'Models are already initialized. Please unload models before changing device.';
+                deviceWarning.style.display = 'block';
+                // Reset to current device
+                this.value = currentDeviceInfo.device_id;
+                return;
+            }
+
+            deviceWarning.style.display = 'none';
+
+            try {
+                updateStatus('Changing device...', 'info');
+                const response = await fetch('/api/set_device', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device_id: selectedDevice})
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    currentDeviceInfo = result.device_info;
+                    updateDeviceInfo();
+                    updateStatus(`Device changed to ${selectedDevice}`, 'success');
+                    logMessage(`✅ Device changed to ${selectedDevice}`);
+                } else {
+                    updateStatus('Failed to change device', 'error');
+                    logMessage('❌ ' + result.error);
+                    // Reset to current device
+                    this.value = currentDeviceInfo.device_id;
+                }
+            } catch (error) {
+                updateStatus('Error changing device', 'error');
+                logMessage('❌ Error changing device: ' + error.message);
+                // Reset to current device
+                this.value = currentDeviceInfo.device_id;
+            }
+        });
+
+        // Unload Models button handler
+        unloadModelsBtn.addEventListener('click', async function() {
+            if (!modelsInitialized) {
+                updateStatus('No models are loaded to unload.', 'info');
+                logMessage('ℹ️ No models are loaded to unload.');
+                return;
+            }
+            unloadModelsBtn.disabled = true;
+            updateStatus('Unloading models...', 'info');
+            try {
+                const response = await fetch('/api/unload', {method: 'POST'});
+                const result = await response.json();
+                if (response.ok) {
+                    modelsInitialized = false;
+                    updateUnloadBtn();
+                    setButtonStates(true, false, false);
+                    updateStatus('Models unloaded. You can now change device.', 'success');
+                    logMessage('🗑️ Models unloaded. Device selection is now enabled.');
+                } else {
+                    updateStatus('Failed to unload models', 'error');
+                    logMessage('❌ Failed to unload models: ' + (result.error || 'Unknown error'));
+                }
+            } catch (error) {
+                updateStatus('Error unloading models', 'error');
+                logMessage('❌ Error unloading models: ' + error.message);
+            } finally {
+                unloadModelsBtn.disabled = false;
+            }
+        });
+        
         // Load initial status
         async function loadStatus() {
             try {
                 const response = await fetch('/api/status');
                 const status = await response.json();
-                
-                deviceName.textContent = status.device;
+
+                currentDeviceInfo = status.device_info;
                 modelsInitialized = status.initialized;
-                
+
+                updateDeviceInfo();
+                updateUnloadBtn();
+
                 if (status.initialized) {
                     updateStatus('Models already initialized', 'success');
                     setButtonStates(true, true, false);
@@ -1254,13 +1629,13 @@ HTML_TEMPLATE = """
                     updateStatus('Ready to initialize models...', 'info');
                     setButtonStates(true, false, false);
                 }
-                
+
                 if (status.tracking) {
                     updateStatus('Tracking in progress...', 'info');
                     setButtonStates(false, false, true);
                 }
-                
-                logMessage('Status loaded - Device: ' + status.device + ', Initialized: ' + status.initialized);
+
+                logMessage('Status loaded - Device: ' + currentDeviceInfo.device_id + ', Initialized: ' + status.initialized);
             } catch (error) {
                 logMessage('❌ Failed to load status: ' + error.message);
             }
@@ -1273,38 +1648,106 @@ HTML_TEMPLATE = """
             let videoFps = 20;
 
             // Handle video upload
-            document.getElementById('videoUploadForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            const videoInput = document.getElementById('videoFile');
-            if (!videoInput.files[0]) return;
 
-            const formData = new FormData();
-            formData.append('video', videoInput.files[0]);
 
-            updateStatus('Uploading video and extracting frames...', 'info');
-            logMessage('Uploading video...');
-            const res = await fetch('/api/upload_video', {method: 'POST', body: formData});
-            const data = await res.json();
-
-            if (!res.ok) {
-                logMessage('❌ ' + (data.error || 'Video upload failed.'));
-                updateStatus('Upload failed: ' + (data.error || 'Unknown error'), 'error');
-                return;
+            // Video Input section feedback helpers
+            function setVideoInputStatus(msg, type = 'info', show = true) {
+                const el = document.getElementById('videoInputStatus');
+                el.innerHTML = msg;
+                el.className = `status ${type}`;
+                el.style.display = show ? '' : 'none';
+            }
+            function setVideoInputProgress(percent, show = true) {
+                const bar = document.getElementById('videoInputProgressBar');
+                const fill = document.getElementById('videoInputProgressFill');
+                if (show) {
+                    bar.style.display = '';
+                    fill.style.width = percent + '%';
+                } else {
+                    bar.style.display = 'none';
+                }
+            }
+            function logVideoInput(msg) {
+                const logEl = document.getElementById('videoInputLog');
+                logEl.style.display = '';
+                const timestamp = new Date().toLocaleTimeString();
+                logEl.innerHTML += `<div>[${timestamp}] ${msg}</div>`;
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            function clearVideoInputLog() {
+                const logEl = document.getElementById('videoInputLog');
+                logEl.innerHTML = '';
+                logEl.style.display = 'none';
             }
 
-            sessionFramesDir = data.frames_dir;
-            uploadedVideoName = data.video_filename;
-            numFrames = data.num_frames;
-            videoFps = data.fps;
-            document.getElementById('videoInfo').innerHTML = 
-                `<div style="color:#059669"><b>Uploaded:</b> ${uploadedVideoName} (${numFrames} frames extracted)</div>`;
-            document.getElementById('videoPreview').innerHTML =
-                `<video controls width="500" style="max-width:100%;">
-                    <source src="${data.video_url}" type="video/mp4">
-                    Your browser does not support the video tag.
-                </video>`;
-            logMessage(`✅ Video uploaded: ${uploadedVideoName}, ${numFrames} frames ready.`);
-            checkEnableTracking();
+            // Add spinner CSS if not present
+            if (!document.getElementById('spinner-style')) {
+                const style = document.createElement('style');
+                style.id = 'spinner-style';
+                style.innerHTML = `
+                    .spinner {
+                        display: inline-block;
+                        width: 18px;
+                        height: 18px;
+                        border: 3px solid #4f46e5;
+                        border-top: 3px solid #fff;
+                        border-radius: 50%;
+                        animation: spin 1s linear infinite;
+                        vertical-align: middle;
+                        margin-left: 6px;
+                    }
+                    @keyframes spin {
+                        0% { transform: rotate(0deg); }
+                        100% { transform: rotate(360deg); }
+                    }
+                `;
+                document.head.appendChild(style);
+            }
+
+            document.getElementById('videoUploadForm').addEventListener('submit', async function(e) {
+                e.preventDefault();
+                const videoInput = document.getElementById('videoFile');
+                if (!videoInput.files[0]) return;
+
+                const formData = new FormData();
+                formData.append('video', videoInput.files[0]);
+
+                // Section feedback
+                setVideoInputStatus('Uploading video and extracting frames... <span class="spinner"></span>', 'info', true);
+                setVideoInputProgress(30, true);
+                clearVideoInputLog();
+                logVideoInput('Uploading video...');
+                document.getElementById('videoInfo').innerHTML = '';
+                document.getElementById('videoPreview').innerHTML = '';
+
+                try {
+                    const res = await fetch('/api/upload_video', {method: 'POST', body: formData});
+                    const data = await res.json();
+
+                    if (!res.ok) {
+                        logVideoInput('❌ ' + (data.error || 'Video upload failed.'));
+                        setVideoInputStatus('Upload failed: ' + (data.error || 'Unknown error'), 'error', true);
+                        setVideoInputProgress(0, false);
+                        return;
+                    }
+
+                    sessionFramesDir = data.frames_dir;
+                    uploadedVideoName = data.video_filename;
+                    numFrames = data.num_frames;
+                    videoFps = data.fps;
+                    document.getElementById('videoInfo').innerHTML = 
+                        `<div style=\"color:#059669\"><b>Uploaded:</b> ${uploadedVideoName} (${numFrames} frames extracted)</div>`;
+                    document.getElementById('videoPreview').innerHTML =
+                        `<video controls width=\"500\" style=\"max-width:100%;\">\n                            <source src=\"${data.video_url}\" type=\"video/mp4\">\n                            Your browser does not support the video tag.\n                        </video>`;
+                    logVideoInput(`✅ Video uploaded: ${uploadedVideoName}, ${numFrames} frames ready.`);
+                    setVideoInputStatus('Video uploaded and frames extracted.', 'success', true);
+                    setVideoInputProgress(100, false);
+                    checkEnableTracking();
+                } catch (err) {
+                    logVideoInput('❌ Video upload failed: ' + err);
+                    setVideoInputStatus('Upload failed: ' + err, 'error', true);
+                    setVideoInputProgress(0, false);
+                }
             });
 
             // Only enable tracking when both are set
@@ -1326,11 +1769,53 @@ def create_template():
 
 
 if __name__ == "__main__":
-    create_template()
-    print("🚀 Starting SAM2MOT Web Application...")
-    print("📱 Access the application at: http://localhost:6011")
-    print("🌐 Or from remote: http://0.0.0.0:6011")
-    print("💡 Make sure to open port 6011 in your firewall!")
+    parser = argparse.ArgumentParser(
+        description="Run the TrackAnything Web Application"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host address to run the application on (default: localhost)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=6011,
+        help="Port to run the application on (default: 6011)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run the application in debug mode (default: False)",
+    )
+    parser.add_argument(
+        "--reloader",
+        action="store_true",
+        help="Enable reloader for development (default: False)",
+    )
+    args = parser.parse_args()
+    # Global tracker instance
+    tracker = SAM2MOTTracker()
 
-    # Run with eventlet for better WebSocket support
-    socketio.run(app, host="0.0.0.0", port=6011, debug=False)
+    import shutil
+    import subprocess
+    import uuid
+
+    from werkzeug.utils import secure_filename
+
+    UPLOAD_ROOT = "/tmp/sam2mot_videos"
+    os.makedirs(UPLOAD_ROOT, exist_ok=True)
+
+    create_template()
+
+    print("🚀 Starting TrackAnything Web Application...")
+    print(f"📱 Access the application at: http://{args.host}:{args.port}")
+
+    socketio.run(
+        app,
+        host=args.host,
+        port=args.port,
+        debug=args.debug,
+        use_reloader=args.reloader,
+    )
